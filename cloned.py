@@ -1490,22 +1490,26 @@ class MainWin(QMainWindow):
 
     # ── Scanning ──
     def _scan(self):
-        self.sbar.showMessage("Scanning drives..."); self.src = self.dst = None; self.go_btn.setEnabled(False)
-        for c in self.src_cards + self.dst_cards: c.deleteLater()
-        self.src_cards.clear(); self.dst_cards.clear()
-        self.drives = enum_drives()
-        if not self.drives: self.sbar.showMessage("No drives found — run as Administrator"); return
+        try:
+            self.sbar.showMessage("Scanning drives..."); self.src = self.dst = None; self.go_btn.setEnabled(False)
+            for c in self.src_cards + self.dst_cards: c.deleteLater()
+            self.src_cards.clear(); self.dst_cards.clear()
+            self.drives = enum_drives()
+            if not self.drives: self.sbar.showMessage("No drives found — run as Administrator"); return
 
-        for layout, widget, handler, kind in [
-            (self.d2d_sl, self.d2d_sw, self._s_d2d_src, "s"), (self.d2d_dl, self.d2d_dw, self._s_d2d_dst, "d"),
-            (self.d2i_sl, self.d2i_sw, self._s_d2i_src, "s"), (self.i2d_dl, self.i2d_dw, self._s_i2d_dst, "d"),
-        ]:
-            for d in self.drives:
-                c = DriveCard(d); c.clicked.connect(handler)
-                layout.insertWidget(layout.count()-1, c)
-                (self.src_cards if kind == "s" else self.dst_cards).append(c)
+            for layout, widget, handler, kind in [
+                (self.d2d_sl, self.d2d_sw, self._s_d2d_src, "s"), (self.d2d_dl, self.d2d_dw, self._s_d2d_dst, "d"),
+                (self.d2i_sl, self.d2i_sw, self._s_d2i_src, "s"), (self.i2d_dl, self.i2d_dw, self._s_i2d_dst, "d"),
+            ]:
+                for d in self.drives:
+                    c = DriveCard(d); c.clicked.connect(handler)
+                    layout.insertWidget(layout.count()-1, c)
+                    (self.src_cards if kind == "s" else self.dst_cards).append(c)
 
-        self.sbar.showMessage(f"Found {len(self.drives)} drive(s)")
+            self.sbar.showMessage(f"Found {len(self.drives)} drive(s)")
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(self, "Scan Error", f"Failed to enumerate drives:\n\n{e}\n\n{traceback.format_exc()}")
 
     # ── Selections ──
     def _sel(self, cards, widget, drive, info_lbl, is_src):
@@ -1529,13 +1533,17 @@ class MainWin(QMainWindow):
         self.img_path = p; self.d2i_pl.setText(p); self.d2i_di.setText(f"Save to: {Path(p).name}"); self._upd_go()
 
     def _browse_load(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Open Image", "", "Cloned Image (*.cloned);;All Files (*)")
-        if not p: return
-        meta = read_image_meta(p)
-        if not meta: QMessageBox.warning(self, "Invalid", "Not a valid .cloned image."); return
-        self.img_path = p; self.img_meta = meta; self.i2d_pl.setText(p)
-        self.i2d_ml.setText(f"Source: {meta.src_model}\nSize: {meta.size_str}  •  Created: {meta.created[:19]}\nSHA-256: {meta.sha256[:32]}...")
-        self.i2d_si.setText(f"Image: {Path(p).name}"); self._upd_go()
+        try:
+            p, _ = QFileDialog.getOpenFileName(self, "Open Image", "", "Cloned Image (*.cloned);;All Files (*)")
+            if not p: return
+            meta = read_image_meta(p)
+            if not meta: QMessageBox.warning(self, "Invalid", "Not a valid .cloned image."); return
+            self.img_path = p; self.img_meta = meta; self.i2d_pl.setText(p)
+            self.i2d_ml.setText(f"Source: {meta.src_model}\nSize: {meta.size_str}  •  Created: {meta.created[:19]}\nSHA-256: {meta.sha256[:32]}...")
+            self.i2d_si.setText(f"Image: {Path(p).name}"); self._upd_go()
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(self, "Error", f"Failed to load image:\n\n{e}\n\n{traceback.format_exc()}")
 
     # ── Mode ──
     def _mode_changed(self, i):
@@ -1555,7 +1563,20 @@ class MainWin(QMainWindow):
 
     # ── Start ──
     def _start(self):
-        [self._go_d2d, self._go_d2i, self._go_i2d][self.mode]()
+        try:
+            [self._go_d2d, self._go_d2i, self._go_i2d][self.mode]()
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self._log(f"\n⛔ CRASH: {e}\n{tb}")
+            QMessageBox.critical(self, "Error", f"Operation failed to start:\n\n{e}\n\nDetails saved to log.")
+            # Save crash log to desktop
+            try:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                crash_path = Path.home() / "Desktop" / f"Cloned_CRASH_{stamp}.log"
+                crash_path.write_text(f"Cloned v{APP_VERSION} crash report\n{datetime.now()}\n\n{tb}", encoding="utf-8")
+            except Exception:
+                pass
 
     def _go_d2d(self):
         s, d = self.src, self.dst
@@ -1736,6 +1757,18 @@ class MainWin(QMainWindow):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # Global crash handler — saves crash log to Desktop instead of silently dying
+    import traceback as _tb
+    def _crash_hook(exc_type, exc_value, exc_tb):
+        msg = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            crash_path = Path.home() / "Desktop" / f"Cloned_CRASH_{datetime.now():%Y%m%d_%H%M%S}.log"
+            crash_path.write_text(f"Cloned v{APP_VERSION} unhandled exception\n{datetime.now()}\n\n{msg}", encoding="utf-8")
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = _crash_hook
+
     if sys.platform == "win32" and not is_admin():
         _a = QApplication(sys.argv)
         if QMessageBox.question(None, APP_NAME,
