@@ -420,7 +420,19 @@ def analyze_d2d(src: DriveInfo, dst: DriveInfo) -> Tuple[str, str]:
         return "ok", (f"Destination is {fmt_bytes(extra)} larger than source. "
                       f"You'll be able to expand the partition after cloning.")
     short = src.size - dst.size
-    return "warn", (f"Destination is {fmt_bytes(short)} SMALLER than source. "
+    pct = (short / src.size * 100) if src.size > 0 else 100
+    # Manufacturer variance: "2 TB" drives vary by a few MB between brands/batches.
+    # Under 0.1% or under 100 MB is normal — partitions never use the last few MB.
+    if pct < 0.1 or short < 100 * 1024 * 1024:
+        return "ok", (f"Drives are effectively the same size ({src.size_str}). "
+                      f"Destination is {fmt_bytes(short)} smaller — this is normal "
+                      f"manufacturer variance and will not affect the clone.")
+    # Under 1 GB on a large drive is still very likely fine
+    if short < 1024 * 1024 * 1024:
+        return "ok", (f"Destination is {fmt_bytes(short)} smaller than source ({pct:.2f}%). "
+                      f"This small difference is almost certainly unused space at the "
+                      f"end of the disk and will not affect bootability or data.")
+    return "warn", (f"Destination is {fmt_bytes(short)} SMALLER than source ({pct:.1f}%). "
                     f"Data beyond {dst.size_str} will be truncated. This may cause data loss "
                     f"if partitions extend past the destination boundary.")
 
@@ -453,9 +465,21 @@ def analyze_i2d(meta: ImageMeta, dst: DriveInfo) -> Tuple[str, str]:
         return "ok", (f"Destination is {fmt_bytes(extra)} larger than image. "
                       f"You'll be able to expand the partition after restoring.")
     short = meta.src_size - dst.size
-    return "error", (f"Destination is {fmt_bytes(short)} SMALLER than image source. "
-                    f"Image requires {meta.size_str}, drive is only {dst.size_str}. "
-                    f"Restore will be truncated and the drive will likely not boot.")
+    pct = (short / meta.src_size * 100) if meta.src_size > 0 else 100
+    # Manufacturer variance: same-capacity drives differ by a few MB.
+    # Under 0.1% or under 100 MB is normal and won't affect anything.
+    if pct < 0.1 or short < 100 * 1024 * 1024:
+        return "ok", (f"Drives are effectively the same size ({meta.size_str}). "
+                      f"Destination is {fmt_bytes(short)} smaller — this is normal "
+                      f"manufacturer variance and will not affect the restore.")
+    if short < 1024 * 1024 * 1024:
+        return "ok", (f"Destination is {fmt_bytes(short)} smaller than image source ({pct:.2f}%). "
+                      f"This small difference is almost certainly unused space at the "
+                      f"end of the disk and will not affect bootability or data.")
+    return "warn", (f"Destination is {fmt_bytes(short)} SMALLER than image source ({pct:.1f}%). "
+                    f"Image was created from a {meta.size_str} drive, destination is {dst.size_str}. "
+                    f"Data beyond the destination size will be truncated. "
+                    f"This may affect the last partition or prevent booting.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PROGRESS TRACKER
