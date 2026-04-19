@@ -321,6 +321,22 @@ def clear_readonly(disk_idx: int, log_fn=None):
     except Exception as e:
         if log_fn: log_fn(f"  Read-only clear failed: {e}")
 
+def clean_disk(disk_idx: int, log_fn=None):
+    """Wipe the partition table via diskpart clean. This forces Windows to release
+    all volume references (including hidden EFI/Recovery/MSR volumes) and guarantees
+    write access to the physical drive."""
+    script = f"select disk {disk_idx}\nclean\n"
+    try:
+        r = subprocess.run(["diskpart"], input=script, capture_output=True,
+                           text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        if log_fn:
+            if "succeeded" in r.stdout.lower() or "clean" in r.stdout.lower():
+                log_fn("  Disk cleaned — partition table wiped")
+            else:
+                log_fn(f"  Disk clean result: {r.stdout.strip()[-80:]}")
+    except Exception as e:
+        if log_fn: log_fn(f"  Disk clean failed: {e}")
+
 def unlock_vol(h):
     if h:
         br = wintypes.DWORD(0)
@@ -627,7 +643,11 @@ class CloneWorker(QThread):
             self.status.emit("Locking all destination volumes...")
             locks = lock_all_volumes(self.dst.index, log_fn=lambda m: self.log.emit(m))
 
-            # Open drive handles AFTER locking
+            # Wipe partition table — forces Windows to release all volume references
+            self.status.emit("Cleaning destination disk...")
+            clean_disk(self.dst.index, log_fn=lambda m: self.log.emit(m))
+
+            # Open drive handles AFTER cleaning
             self.status.emit("Opening drives...")
             sh = open_read(self.src.path)
             dh = open_write(self.dst.path)
@@ -927,7 +947,11 @@ class RestoreWorker(QThread):
             self.status.emit("Locking all destination volumes...")
             locks = lock_all_volumes(self.dst.index, log_fn=lambda m: self.log.emit(m))
 
-            # Open drive handle AFTER locking all volumes
+            # Wipe partition table — forces Windows to release all volume references
+            self.status.emit("Cleaning destination disk...")
+            clean_disk(self.dst.index, log_fn=lambda m: self.log.emit(m))
+
+            # Open drive handle AFTER cleaning
             self.status.emit("Opening destination drive...")
             dh = open_write(self.dst.path)
             self.log.emit("Drive handle opened")
