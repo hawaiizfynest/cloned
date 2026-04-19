@@ -361,21 +361,30 @@ def clear_readonly(disk_idx: int, log_fn=None):
     except Exception as e:
         if log_fn: log_fn(f"  Read-only clear failed: {e}")
 
-def clean_disk(disk_idx: int, log_fn=None):
+def clean_disk(disk_idx: int, log_fn=None, max_attempts=3):
     """Wipe the partition table via diskpart clean. This forces Windows to release
     all volume references (including hidden EFI/Recovery/MSR volumes) and guarantees
-    write access to the physical drive."""
+    write access to the physical drive. Retries on timeout. Returns True on success."""
     script = f"select disk {disk_idx}\nclean\n"
-    try:
-        r = subprocess.run(["diskpart"], input=script, capture_output=True,
-                           text=True, timeout=120, creationflags=subprocess.CREATE_NO_WINDOW)
-        if log_fn:
-            if "succeeded" in r.stdout.lower() or "clean" in r.stdout.lower():
-                log_fn("  Disk cleaned — partition table wiped")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = subprocess.run(["diskpart"], input=script, capture_output=True,
+                               text=True, timeout=120, creationflags=subprocess.CREATE_NO_WINDOW)
+            out = r.stdout.lower()
+            if "succeeded" in out or "clean" in out:
+                if log_fn: log_fn("  Disk cleaned — partition table wiped")
+                return True
             else:
-                log_fn(f"  Disk clean result: {r.stdout.strip()[-80:]}")
-    except Exception as e:
-        if log_fn: log_fn(f"  Disk clean failed: {e}")
+                if log_fn: log_fn(f"  Disk clean attempt {attempt}/{max_attempts}: {r.stdout.strip()[-80:]}")
+        except subprocess.TimeoutExpired:
+            if log_fn: log_fn(f"  Disk clean attempt {attempt}/{max_attempts} timed out after 120s")
+        except Exception as e:
+            if log_fn: log_fn(f"  Disk clean attempt {attempt}/{max_attempts} failed: {e}")
+        if attempt < max_attempts:
+            if log_fn: log_fn(f"  Retrying diskpart clean in 3s...")
+            time.sleep(3)
+    if log_fn: log_fn(f"  ⛔ Disk clean FAILED after {max_attempts} attempts")
+    return False
 
 def unlock_vol(h):
     if h:
@@ -685,7 +694,9 @@ class CloneWorker(QThread):
 
             # Wipe partition table — forces Windows to release all volume references
             self.status.emit("Cleaning destination disk...")
-            clean_disk(self.dst.index, log_fn=lambda m: self.log.emit(m))
+            if not clean_disk(self.dst.index, log_fn=lambda m: self.log.emit(m)):
+                self.finished_sig.emit(False, "Aborted: diskpart clean failed — cannot safely write to destination disk")
+                return
 
             # Open drive handles AFTER cleaning
             self.status.emit("Opening drives...")
@@ -1054,7 +1065,9 @@ class RestoreWorker(QThread):
 
             # Wipe partition table — forces Windows to release all volume references
             self.status.emit("Cleaning destination disk...")
-            clean_disk(self.dst.index, log_fn=lambda m: self.log.emit(m))
+            if not clean_disk(self.dst.index, log_fn=lambda m: self.log.emit(m)):
+                self.finished_sig.emit(False, "Aborted: diskpart clean failed — cannot safely write to destination disk")
+                return
 
             # Open drive handle AFTER cleaning
             self.status.emit("Opening destination drive...")
