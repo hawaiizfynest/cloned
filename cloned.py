@@ -45,6 +45,7 @@ FILE_SHARE_WRITE      = 0x00000002
 OPEN_EXISTING         = 3
 FILE_FLAG_NO_BUFFERING   = 0x20000000
 FILE_FLAG_WRITE_THROUGH  = 0x80000000
+FILE_FLAG_SEQUENTIAL     = 0x08000000  # Hint: optimize for sequential reads
 INVALID_HANDLE_VALUE  = ctypes.c_void_p(-1).value
 
 FSCTL_LOCK_VOLUME     = 0x00090018
@@ -73,10 +74,10 @@ _FlushBuffers  = kernel32.FlushFileBuffers
 
 APP_NAME    = "Cloned"
 APP_VERSION = "1.0.0"
-CHUNK_SIZE  = 4 * 1024 * 1024   # 4 MB — balanced for speed and memory
+CHUNK_SIZE  = 16 * 1024 * 1024  # 16 MB — larger chunks = fewer syscalls = faster
 IMG_MAGIC   = b"CLONED01"
 IMG_FMT_VER = "1.0"
-ZLIB_LEVEL  = 6                  # 1-9, 6 = balanced speed/ratio
+ZLIB_LEVEL  = 3                  # 1-9, 3 = fast compression with decent ratio
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA MODELS
@@ -211,7 +212,8 @@ def run_diskpart(script: str):
 
 def open_read(path: str):
     h = _CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                     None, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, None)
+                     None, OPEN_EXISTING,
+                     FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL, None)
     if h == INVALID_HANDLE_VALUE:
         raise OSError(f"Cannot open {path} for reading (error {_GetLastError()}). "
                       "Ensure you are running as Administrator.")
@@ -220,7 +222,7 @@ def open_read(path: str):
 def open_write(path: str):
     h = _CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
                      FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING,
-                     FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH, None)
+                     FILE_FLAG_NO_BUFFERING, None)
     if h == INVALID_HANDLE_VALUE:
         raise OSError(f"Cannot open {path} for writing (error {_GetLastError()}). "
                       "Is the drive locked by another process or BitLocker-encrypted?")
