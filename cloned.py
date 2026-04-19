@@ -538,18 +538,19 @@ class CloneWorker(QThread):
             self.log.emit(f"Source: Disk {self.src.index} — {self.src.model} ({self.src.size_str})")
             self.log.emit(f"Dest:   Disk {self.dst.index} — {self.dst.model} ({self.dst.size_str})")
 
-            # Lock dest volumes
+            # Open drive handles FIRST, before locking volumes
+            self.status.emit("Opening drives...")
+            sh = open_read(self.src.path)
+            dh = open_write(self.dst.path)
+            self.log.emit("Drive handles opened")
+
+            # Lock and dismount destination volumes
             self.status.emit("Locking destination volumes...")
             for p in self.dst.parts:
                 if p.letter:
                     vh = lock_vol(p.letter)
-                    if vh: locks.append(vh); self.log.emit(f"  Locked {p.letter}")
+                    if vh: locks.append(vh); self.log.emit(f"  Locked & dismounted {p.letter}")
                     else:  self.log.emit(f"  Warning: could not lock {p.letter}")
-
-            run_diskpart(f"select disk {self.dst.index}\noffline disk\n")
-
-            sh = open_read(self.src.path)
-            dh = open_write(self.dst.path)
 
             total = drive_size(sh) or self.src.size
             self.log.emit(f"Clone size: {fmt_bytes(total)}")
@@ -577,7 +578,8 @@ class CloneWorker(QThread):
 
                 seek(dh, done)
                 if not _WriteFile(dh, buf, br.value, ctypes.byref(bw), None):
-                    errors += 1; self.log.emit(f"  Write error @ {done}")
+                    err = _GetLastError()
+                    errors += 1; self.log.emit(f"  Write error @ {done} (Win32 error {err})")
 
                 done += br.value
                 trk.tick(done, total, self)
@@ -836,15 +838,17 @@ class RestoreWorker(QThread):
                 self.finished_sig.emit(False, f"Image validation failed: {vmsg}"); return
             self.log.emit("Image validation PASSED — safe to restore")
 
-            # Lock dest
-            self.phase.emit("restore"); self.status.emit("Preparing destination...")
+            # Open drive handle FIRST, before locking volumes
+            self.phase.emit("restore"); self.status.emit("Opening destination drive...")
+            dh = open_write(self.dst.path)
+            self.log.emit("Drive handle opened")
+
+            # Lock and dismount destination volumes
+            self.status.emit("Locking destination volumes...")
             for p in self.dst.parts:
                 if p.letter:
                     vh = lock_vol(p.letter)
-                    if vh: locks.append(vh); self.log.emit(f"  Locked {p.letter}")
-
-            run_diskpart(f"select disk {self.dst.index}\noffline disk\n")
-            dh = open_write(self.dst.path)
+                    if vh: locks.append(vh); self.log.emit(f"  Locked & dismounted {p.letter}")
 
             # Restore
             self.status.emit("Restoring..."); self.progress.emit(0)
@@ -872,7 +876,8 @@ class RestoreWorker(QThread):
                 wb = ctypes.create_string_buffer(raw)
                 seek(dh, done)
                 if not _WriteFile(dh, wb, len(raw), ctypes.byref(bw), None):
-                    errors += 1; self.log.emit(f"  Write error @ {done}")
+                    err = _GetLastError()
+                    errors += 1; self.log.emit(f"  Write error @ {done} (Win32 error {err})")
 
                 done += len(raw); trk.tick(done, expected, self)
 
