@@ -17,29 +17,40 @@ Cloned is a production-grade desktop application for cloning entire drives, savi
 ### Core Capabilities
 
 - **Full Sector-by-Sector I/O** — Copies every byte including MBR/GPT partition tables, boot records, EFI system partitions, recovery partitions, and all filesystem data
-- **All Drive Types** — HDD, SATA SSD, NVMe, and USB-connected external drives (internal + external)
-- **Size Analysis** — Compares source vs destination before every operation. Warns if the destination is too small, shows exact size differences, and checks free space for image saves
+- **All Drive Types** — HDD, SATA SSD, NVMe, and USB-connected external drives via caddies and docking stations
+- **Size Analysis** — Compares source vs destination before every operation. Warns if the destination is too small, shows exact size differences, checks free space for image saves, and handles manufacturer variance between same-capacity drives
 - **Small → Large Cloning** — After cloning to a larger drive, Cloned offers to automatically expand the last partition to fill the entire drive
 - **Compressed Images** — zlib compression reduces image file size (30–90% of original depending on drive content)
-- **Automatic Validation** — Every image is validated chunk-by-chunk (SHA-256 per 4MB block + full-image digest) immediately after creation. Images are also validated before every restore. Corrupt images are refused.
+- **Automatic Validation** — Every image is validated chunk-by-chunk (SHA-256 per 16MB block + full-image digest) immediately after creation. Images can optionally be validated before restore. Corrupt images are refused.
 - **Post-Operation Verification** — Optional byte-for-byte verification pass compares the destination against the source/image
 - **UAC Elevation** — Automatic Administrator privilege request on launch via Windows UAC
+- **Sleep Prevention** — Prevents Windows from sleeping during operations so USB drives don't disconnect mid-clone
 - **Pause / Resume / Cancel** — Full control over long-running operations
-- **Live Progress** — Real-time transfer speed, ETA, bytes transferred, and operation logging
+
+### v2.0.0 Improvements
+
+- **Read/Write Retry with Backoff** — Failed reads and writes are retried up to 5 times with increasing delay (0.3s, 0.6s, 0.9s, 1.2s, 1.5s) before giving up. Critical for recovering data from failing drives where sectors may succeed on retry.
+- **Completion Sound** — Plays a Windows notification sound when an operation finishes (success or failure) so you don't have to watch multi-hour clones
+- **Auto-Save Log** — Every operation log is automatically saved as a timestamped `.log` file on the Desktop. Useful for client records — includes SHA-256 hashes, error details, elapsed time, and transfer speeds.
+- **Human-Readable Error Codes** — Log messages now show "Access Denied (5)" or "I/O Device Error (1117)" instead of raw Win32 error numbers
+- **Elapsed Time Display** — Live elapsed time counter in the progress area alongside speed and ETA
+- **Performance Optimizations** — 16 MB chunks (4x larger), removed per-write cache flushing, sequential read hints, and faster compression for significantly improved transfer speeds especially on USB
 
 ### Safety
 
 - **Type-to-confirm** dialog (type "CLONE") before any destructive operation
+- **Disk clean before write** — Wipes partition table via diskpart before clone/restore to guarantee write access
 - **System drive detection** — Warns before overwriting the active Windows drive
 - **Same-drive protection** — Cannot select the same drive as both source and destination
 - **Free space analysis** — Blocks image saves that won't fit on the destination filesystem
-- **Volume locking** — Destination volumes are locked, dismounted, and taken offline before writing
+- **Comprehensive volume locking** — All volumes on the destination disk are locked and dismounted, including hidden EFI/Recovery/MSR partitions without drive letters
+- **Read-only clearing** — Automatically clears the read-only attribute that USB bridges sometimes set
 
 ## Do I Need a Bootable Drive?
 
 **Short answer: No, for most MSP workflows.**
 
-The typical scenario — pulling a failing drive from a client PC, connecting it via USB dock, and cloning to new hardware — runs perfectly within Windows because the failing drive isn't the active OS.
+The typical scenario — pulling a failing drive from a client PC, connecting it via USB caddy, and cloning to a new drive in another caddy — runs perfectly within Windows because neither drive is the active OS.
 
 For the less common case where you need to clone the currently-running Windows drive (e.g., migrating your own workstation), Cloned reads raw sectors and produces a clone that boots. Windows runs chkdsk on first boot to resolve any open-file inconsistencies. This works well for workstations and laptops.
 
@@ -72,7 +83,7 @@ python cloned.py
 
 ```
 pip install pyinstaller
-pyinstaller --onefile --windowed --name Cloned cloned.py
+pyinstaller --onefile --windowed --name Cloned --uac-admin cloned.py
 ```
 
 Output: `dist/Cloned.exe`
@@ -100,8 +111,9 @@ Output: `dist/Cloned.exe`
 1. Select **📦→💿 Image to Drive** mode
 2. Click **Choose Image File** — metadata displays instantly (source drive, size, SHA-256)
 3. Click the destination drive — Cloned compares the image size vs drive size
-4. Click **Restore Image**, type `CLONE` to confirm
-5. Image is validated before restore begins. After restore, partition expansion is offered if applicable.
+4. Uncheck **Validate image before restore** if the image was previously validated and you want to skip the validation pass
+5. Click **Restore Image**, type `CLONE` to confirm
+6. After restore, partition expansion is offered if the destination is larger
 
 ### Boot Drive Migration Workflow
 
@@ -112,13 +124,17 @@ Output: `dist/Cloned.exe`
    - "Repair your computer" → Command Prompt
    - `bootrec /fixboot` then `bcdboot C:\Windows`
 
+### Operation Logs
+
+Every operation automatically saves a log file to your Desktop with the naming format `Cloned_<operation>_<timestamp>.log`. These logs include the full operation details: source/destination info, SHA-256 hashes, any errors with human-readable codes, transfer speeds, and total elapsed time. Keep these for client records.
+
 ## Image Format (.cloned)
 
 Purpose-built for reliability:
 
 - `CLONED01` magic header for instant identification
 - JSON metadata: source model, serial, size, sector size, partition layout, timestamp
-- Per-chunk SHA-256 hash (every 4MB block individually verified)
+- Per-chunk SHA-256 hash (every 16MB block individually verified)
 - zlib compression per chunk
 - Full-image SHA-256 digest in footer
 - EOF marker separating data from footer hash
@@ -142,8 +158,9 @@ Cloned/
 - **ctypes** — Windows CreateFileW API for raw sector I/O with 64-bit SetFilePointerEx
 - **zlib** + **hashlib** — Compression and SHA-256 integrity verification
 - **PowerShell/WMI** — Drive enumeration and partition expansion (Resize-Partition)
-- **diskpart** — Volume locking and disk online/offline management
-- **PyInstaller** — Single-file EXE packaging
+- **diskpart** — Volume locking, read-only clearing, disk cleaning, and online/offline management
+- **winsound** — Completion notifications
+- **PyInstaller** — Single-file EXE packaging with UAC manifest
 - **GitHub Actions** — Automated release builds on version tag push
 
 ## License

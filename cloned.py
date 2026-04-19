@@ -1,5 +1,5 @@
 """
-Cloned v1.0.0 — Sector-by-Sector Drive Cloning & Imaging Tool
+Cloned v2.0.0 — Sector-by-Sector Drive Cloning & Imaging Tool
 Clone entire drives, save drives to validated compressed image files,
 and restore images back to physical drives.
 Supports HDD, SATA SSD, NVMe, internal drives, and USB-connected drives.
@@ -19,6 +19,7 @@ import zlib
 import threading
 import subprocess
 import shutil
+import winsound
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
@@ -31,7 +32,7 @@ from PyQt6.QtWidgets import (
     QDialog, QGridLayout, QScrollArea, QFileDialog, QLineEdit,
     QButtonGroup, QRadioButton, QStackedWidget
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor, QPalette
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -73,11 +74,29 @@ _FlushBuffers  = kernel32.FlushFileBuffers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 APP_NAME    = "Cloned"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 CHUNK_SIZE  = 16 * 1024 * 1024  # 16 MB — larger chunks = fewer syscalls = faster
 IMG_MAGIC   = b"CLONED01"
 IMG_FMT_VER = "1.0"
 ZLIB_LEVEL  = 3                  # 1-9, 3 = fast compression with decent ratio
+MAX_RETRIES = 5                  # Retries per chunk on read/write failure
+RETRY_DELAY = 0.3                # Seconds between retries (increases with backoff)
+
+# Human-readable Win32 error codes
+WIN32_ERRORS = {
+    0: "Success", 1: "Invalid Function", 2: "File Not Found", 3: "Path Not Found",
+    5: "Access Denied", 6: "Invalid Handle", 8: "Not Enough Memory",
+    21: "Device Not Ready", 23: "Data Error (CRC)", 25: "Seek Error",
+    27: "Sector Not Found", 29: "Write Fault", 30: "Read Fault",
+    31: "General Failure", 32: "Sharing Violation", 33: "Lock Violation",
+    55: "Device Not Exist", 87: "Invalid Parameter", 112: "Disk Full",
+    170: "Resource Busy", 1117: "I/O Device Error", 1167: "Device Not Connected",
+}
+
+def win32_err(code: int) -> str:
+    """Return a human-readable Win32 error string."""
+    name = WIN32_ERRORS.get(code, "Unknown")
+    return f"{name} ({code})"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA MODELS
@@ -674,15 +693,36 @@ class CloneWorker(QThread):
                 rs = min(chunk, total - done)
                 if rs % sec: rs = ((rs // sec) + 1) * sec
 
-                seek(sh, done)
-                if not _ReadFile(sh, buf, rs, ctypes.byref(br), None) or br.value == 0:
-                    errors += 1; self.log.emit(f"  Read error @ {done}, zero-filling")
+                # Read with retry
+                read_ok = False
+                for attempt in range(MAX_RETRIES):
+                    seek(sh, done)
+                    if _ReadFile(sh, buf, rs, ctypes.byref(br), None) and br.value > 0:
+                        read_ok = True; break
+                    if attempt < MAX_RETRIES - 1:
+                        delay = RETRY_DELAY * (attempt + 1)
+                        self.log.emit(f"  Read retry {attempt+1}/{MAX_RETRIES} @ {done} "
+                                      f"— {win32_err(_GetLastError())}, waiting {delay:.1f}s")
+                        time.sleep(delay)
+                if not read_ok:
+                    errors += 1
+                    self.log.emit(f"  Read FAILED @ {done} after {MAX_RETRIES} attempts — {win32_err(_GetLastError())}, zero-filling")
                     ctypes.memset(buf, 0, rs); br.value = rs
 
-                seek(dh, done)
-                if not _WriteFile(dh, buf, br.value, ctypes.byref(bw), None):
-                    err = _GetLastError()
-                    errors += 1; self.log.emit(f"  Write error @ {done} (Win32 error {err})")
+                # Write with retry
+                write_ok = False
+                for attempt in range(MAX_RETRIES):
+                    seek(dh, done)
+                    if _WriteFile(dh, buf, br.value, ctypes.byref(bw), None):
+                        write_ok = True; break
+                    if attempt < MAX_RETRIES - 1:
+                        delay = RETRY_DELAY * (attempt + 1)
+                        self.log.emit(f"  Write retry {attempt+1}/{MAX_RETRIES} @ {done} "
+                                      f"— {win32_err(_GetLastError())}, waiting {delay:.1f}s")
+                        time.sleep(delay)
+                if not write_ok:
+                    errors += 1
+                    self.log.emit(f"  Write FAILED @ {done} after {MAX_RETRIES} attempts — {win32_err(_GetLastError())}")
 
                 done += br.value
                 trk.tick(done, total, self)
@@ -809,9 +849,19 @@ class ImagingWorker(QThread):
                 rs = min(chunk, total - done)
                 if rs % sec: rs = ((rs // sec) + 1) * sec
 
-                seek(sh, done)
-                if not _ReadFile(sh, buf, rs, ctypes.byref(br), None) or br.value == 0:
-                    self.log.emit(f"  Read error @ {done}, zero-filling")
+                # Read with retry
+                read_ok = False
+                for attempt in range(MAX_RETRIES):
+                    seek(sh, done)
+                    if _ReadFile(sh, buf, rs, ctypes.byref(br), None) and br.value > 0:
+                        read_ok = True; break
+                    if attempt < MAX_RETRIES - 1:
+                        delay = RETRY_DELAY * (attempt + 1)
+                        self.log.emit(f"  Read retry {attempt+1}/{MAX_RETRIES} @ {done} "
+                                      f"— {win32_err(_GetLastError())}, waiting {delay:.1f}s")
+                        time.sleep(delay)
+                if not read_ok:
+                    self.log.emit(f"  Read FAILED @ {done} after {MAX_RETRIES} attempts — {win32_err(_GetLastError())}, zero-filling")
                     ctypes.memset(buf, 0, rs); br.value = rs
 
                 actual = min(br.value, total - done)
@@ -985,10 +1035,19 @@ class RestoreWorker(QThread):
                     errors += 1; self.log.emit(f"  Chunk hash mismatch @ offset {done}")
 
                 wb = ctypes.create_string_buffer(raw)
-                seek(dh, done)
-                if not _WriteFile(dh, wb, len(raw), ctypes.byref(bw), None):
-                    err = _GetLastError()
-                    errors += 1; self.log.emit(f"  Write error @ {done} (Win32 error {err})")
+                write_ok = False
+                for attempt in range(MAX_RETRIES):
+                    seek(dh, done)
+                    if _WriteFile(dh, wb, len(raw), ctypes.byref(bw), None):
+                        write_ok = True; break
+                    if attempt < MAX_RETRIES - 1:
+                        delay = RETRY_DELAY * (attempt + 1)
+                        self.log.emit(f"  Write retry {attempt+1}/{MAX_RETRIES} @ {done} "
+                                      f"— {win32_err(_GetLastError())}, waiting {delay:.1f}s")
+                        time.sleep(delay)
+                if not write_ok:
+                    errors += 1
+                    self.log.emit(f"  Write FAILED @ {done} after {MAX_RETRIES} attempts — {win32_err(_GetLastError())}")
 
                 done += len(raw); trk.tick(done, expected, self)
 
@@ -1338,8 +1397,15 @@ class MainWin(QMainWindow):
         self.pbar = QProgressBar(); self.pbar.setRange(0,1000); self.pbar.setValue(0); pl.addWidget(self.pbar)
         sl2 = QHBoxLayout()
         self.spd_lbl = QLabel("Speed: --"); self.spd_lbl.setStyleSheet("color:#aaa; font-size:11px;"); sl2.addWidget(self.spd_lbl)
-        self.byt_lbl = QLabel("0 B / 0 B"); self.byt_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter); self.byt_lbl.setStyleSheet("color:#aaa; font-size:11px;"); sl2.addWidget(self.byt_lbl)
+        self.byt_lbl = QLabel("0 B / 0 B"); self.byt_lbl.setStyleSheet("color:#aaa; font-size:11px;"); sl2.addWidget(self.byt_lbl)
+        self.elapsed_lbl = QLabel("Elapsed: --:--:--"); self.elapsed_lbl.setStyleSheet("color:#aaa; font-size:11px;"); sl2.addWidget(self.elapsed_lbl)
         self.eta_lbl = QLabel("ETA: --:--:--"); self.eta_lbl.setAlignment(Qt.AlignmentFlag.AlignRight); self.eta_lbl.setStyleSheet("color:#aaa; font-size:11px;"); sl2.addWidget(self.eta_lbl)
+
+        # Elapsed timer
+        self._op_start = 0.0
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
         pl.addLayout(sl2); m.addWidget(pg)
 
         self.log_box = QTextEdit(); self.log_box.setReadOnly(True); self.log_box.setMaximumHeight(150); self.log_box.setPlaceholderText("Operation log..."); m.addWidget(self.log_box)
@@ -1486,10 +1552,15 @@ class MainWin(QMainWindow):
         w.log.connect(self._log)
         w.finished_sig.connect(self._done)
 
+        self._current_op = op
         self.log_box.clear()
         self._log(f"{'='*50}\n  {APP_NAME} v{APP_VERSION} — {op.title()}\n  {datetime.now():%Y-%m-%d %H:%M:%S}\n{'='*50}")
         w.start()
         prevent_sleep()
+
+        # Start elapsed timer
+        self._op_start = time.time()
+        self._elapsed_timer.start()
 
         self.go_btn.setEnabled(False); self.scan_btn.setEnabled(False); self.vfy_cb.setEnabled(False); self.val_cb.setEnabled(False)
         self.pause_btn.setEnabled(True); self.xbtn.setEnabled(True)
@@ -1529,8 +1600,15 @@ class MainWin(QMainWindow):
                 QMessageBox.warning(self, "Expand Failed",
                     f"Could not auto-expand: {msg}\n\nYou can expand manually in Disk Management.")
 
+    def _update_elapsed(self):
+        if self._op_start > 0:
+            self.elapsed_lbl.setText(f"Elapsed: {fmt_eta(time.time() - self._op_start)}")
+
     def _done(self, ok, msg):
         allow_sleep()
+        self._elapsed_timer.stop()
+        total_time = time.time() - self._op_start if self._op_start > 0 else 0
+        self.elapsed_lbl.setText(f"Elapsed: {fmt_eta(total_time)}")
         self.worker = None
         ic = "✅" if ok else "❌"; c = "#16c79a" if ok else "#e94560"
         self.phase_lbl.setText(f"{ic} {'Complete' if ok else 'Failed'}")
@@ -1538,9 +1616,40 @@ class MainWin(QMainWindow):
         self.go_btn.setEnabled(False); self.scan_btn.setEnabled(True); self.vfy_cb.setEnabled(True); self.val_cb.setEnabled(True)
         self.pause_btn.setEnabled(False); self.xbtn.setEnabled(False)
         for r in self.rb: r.setEnabled(True)
-        self._log(f"\n{msg}"); self.sbar.showMessage(msg)
+
+        # Add elapsed to log
+        self._log(f"\nTotal time: {fmt_eta(total_time)}")
+        self._log(f"\n{msg}")
+        self.sbar.showMessage(msg)
+
+        # Auto-save log to file
+        self._save_log()
+
+        # Completion sound
+        try:
+            if ok:
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            else:
+                winsound.MessageBeep(winsound.MB_ICONHAND)
+        except Exception:
+            pass
+
         (QMessageBox.information if ok else QMessageBox.warning)(self, "Result", msg)
         self._scan()
+
+    def _save_log(self):
+        """Auto-save the operation log to a text file on the desktop."""
+        try:
+            desktop = Path.home() / "Desktop"
+            if not desktop.exists():
+                desktop = Path.home()
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            op = getattr(self, '_current_op', 'operation')
+            log_path = desktop / f"Cloned_{op}_{stamp}.log"
+            log_path.write_text(self.log_box.toPlainText(), encoding="utf-8")
+            self._log(f"Log saved: {log_path}")
+        except Exception as e:
+            self._log(f"Could not save log: {e}")
 
     def _log(self, t):
         self.log_box.append(t); self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
