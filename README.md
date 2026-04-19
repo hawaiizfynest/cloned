@@ -36,10 +36,20 @@ Cloned is a production-grade desktop application for cloning entire drives, savi
 - **Elapsed Time Display** — Live elapsed time counter in the progress area alongside speed and ETA
 - **Performance Optimizations** — 16 MB chunks (4x larger), removed per-write cache flushing, sequential read hints, and faster compression for significantly improved transfer speeds especially on USB
 
+### v2.0.1 — USB Disconnect Recovery
+
+- **USB Glitch Recovery** — On write failure (error 5 or 21), Cloned closes the stale disk handle and reopens it. If the USB bridge briefly disconnected and came back, the operation continues from where it left off instead of failing every remaining chunk.
+- **Cascade Abort** — If 10 consecutive chunks fail even after retries and handle reopening, Cloned aborts immediately with a clear message identifying a likely USB bridge disconnect. Prevents hours of wasted time writing to a dead handle.
+
+### v2.0.2 — Diskpart Clean Retry
+
+- **Diskpart Clean Retry** — If `diskpart clean` fails or times out, Cloned retries up to 3 attempts with a 3-second delay between each. If all attempts fail, the operation aborts entirely rather than proceeding with a potentially locked disk.
+
 ### Safety
 
 - **Type-to-confirm** dialog (type "CLONE") before any destructive operation
-- **Disk clean before write** — Wipes partition table via diskpart before clone/restore to guarantee write access
+- **Disk clean before write** — Wipes partition table via diskpart before clone/restore to guarantee write access. Retries up to 3 times on failure and aborts if unsuccessful.
+- **Cascade failure protection** — Detects USB bridge disconnects (consecutive read/write failures) and aborts early with a clear diagnostic message
 - **System drive detection** — Warns before overwriting the active Windows drive
 - **Same-drive protection** — Cannot select the same drive as both source and destination
 - **Free space analysis** — Blocks image saves that won't fit on the destination filesystem
