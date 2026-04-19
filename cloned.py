@@ -230,7 +230,7 @@ def drive_size(h) -> int:
     return 0
 
 def lock_vol(letter: str):
-    """Lock and dismount a volume. Returns handle or None."""
+    """Lock and dismount a volume by drive letter. Returns handle or None."""
     h = _CreateFileW(f"\\\\.\\{letter}", GENERIC_READ | GENERIC_WRITE,
                      FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None)
     if h == INVALID_HANDLE_VALUE: return None
@@ -239,6 +239,74 @@ def lock_vol(letter: str):
         _CloseHandle(h); return None
     _DeviceIoCtl(h, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0, ctypes.byref(br), None)
     return h
+
+def lock_vol_path(vol_path: str):
+    """Lock and dismount a volume by its GUID path (\\\\?\\Volume{...}). Returns handle or None."""
+    # Volume GUID paths end with backslash — strip it for CreateFileW
+    p = vol_path.rstrip("\\")
+    h = _CreateFileW(p, GENERIC_READ | GENERIC_WRITE,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None)
+    if h == INVALID_HANDLE_VALUE: return None
+    br = wintypes.DWORD(0)
+    if not _DeviceIoCtl(h, FSCTL_LOCK_VOLUME, None, 0, None, 0, ctypes.byref(br), None):
+        _CloseHandle(h); return None
+    _DeviceIoCtl(h, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0, ctypes.byref(br), None)
+    return h
+
+def enum_disk_volumes(disk_idx: int) -> list:
+    """Get ALL volume GUID paths on a physical disk, including hidden partitions
+    (EFI, Recovery, MSR) that don't have drive letters."""
+    ok, raw = run_ps(
+        f'Get-Partition -DiskNumber {disk_idx} -ErrorAction SilentlyContinue | '
+        f'ForEach-Object {{ $_.AccessPaths }} | '
+        f'Where-Object {{ $_ -like "\\\\?\\*" }} | '
+        f'ConvertTo-Json -Compress')
+    if not ok or not raw: return []
+    try:
+        paths = json.loads(raw)
+        if isinstance(paths, str): paths = [paths]
+        return [p for p in paths if p]
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+def lock_all_volumes(disk_idx: int, log_fn=None) -> list:
+    """Lock and dismount ALL volumes on a disk — lettered AND hidden.
+    Returns list of handles to unlock later."""
+    handles = []
+
+    # Get all volume GUID paths on this disk
+    vol_paths = enum_disk_volumes(disk_idx)
+    if log_fn:
+        log_fn(f"  Found {len(vol_paths)} volume(s) on disk {disk_idx}")
+
+    for vp in vol_paths:
+        vh = lock_vol_path(vp)
+        if vh:
+            handles.append(vh)
+            if log_fn:
+                # Show a short version of the GUID path
+                short = vp.split("{")[1][:8] + "..." if "{" in vp else vp[-20:]
+                log_fn(f"  Locked volume {short}")
+        else:
+            if log_fn:
+                log_fn(f"  Warning: could not lock {vp[-30:]}")
+
+    return handles
+
+def clear_readonly(disk_idx: int, log_fn=None):
+    """Clear read-only attribute on a disk via diskpart. USB-connected drives
+    sometimes get flagged read-only by Windows."""
+    script = f"select disk {disk_idx}\nattributes disk clear readonly\n"
+    try:
+        r = subprocess.run(["diskpart"], input=script, capture_output=True,
+                           text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        if log_fn:
+            if "successfully" in r.stdout.lower() or r.returncode == 0:
+                log_fn("  Cleared read-only attribute")
+            else:
+                log_fn(f"  Read-only clear: {r.stdout.strip()[-80:]}")
+    except Exception as e:
+        if log_fn: log_fn(f"  Read-only clear failed: {e}")
 
 def unlock_vol(h):
     if h:
@@ -538,19 +606,19 @@ class CloneWorker(QThread):
             self.log.emit(f"Source: Disk {self.src.index} — {self.src.model} ({self.src.size_str})")
             self.log.emit(f"Dest:   Disk {self.dst.index} — {self.dst.model} ({self.dst.size_str})")
 
-            # Open drive handles FIRST, before locking volumes
+            # Clear read-only attribute (USB drives sometimes get this)
+            self.status.emit("Preparing destination disk...")
+            clear_readonly(self.dst.index, log_fn=lambda m: self.log.emit(m))
+
+            # Lock ALL volumes on dest disk — including hidden EFI/Recovery/MSR
+            self.status.emit("Locking all destination volumes...")
+            locks = lock_all_volumes(self.dst.index, log_fn=lambda m: self.log.emit(m))
+
+            # Open drive handles AFTER locking
             self.status.emit("Opening drives...")
             sh = open_read(self.src.path)
             dh = open_write(self.dst.path)
             self.log.emit("Drive handles opened")
-
-            # Lock and dismount destination volumes
-            self.status.emit("Locking destination volumes...")
-            for p in self.dst.parts:
-                if p.letter:
-                    vh = lock_vol(p.letter)
-                    if vh: locks.append(vh); self.log.emit(f"  Locked & dismounted {p.letter}")
-                    else:  self.log.emit(f"  Warning: could not lock {p.letter}")
 
             total = drive_size(sh) or self.src.size
             self.log.emit(f"Clone size: {fmt_bytes(total)}")
@@ -838,17 +906,18 @@ class RestoreWorker(QThread):
                 self.finished_sig.emit(False, f"Image validation failed: {vmsg}"); return
             self.log.emit("Image validation PASSED — safe to restore")
 
-            # Open drive handle FIRST, before locking volumes
-            self.phase.emit("restore"); self.status.emit("Opening destination drive...")
+            # Clear read-only attribute (USB drives sometimes get this)
+            self.phase.emit("restore"); self.status.emit("Preparing destination disk...")
+            clear_readonly(self.dst.index, log_fn=lambda m: self.log.emit(m))
+
+            # Lock ALL volumes on dest disk — including hidden EFI/Recovery/MSR
+            self.status.emit("Locking all destination volumes...")
+            locks = lock_all_volumes(self.dst.index, log_fn=lambda m: self.log.emit(m))
+
+            # Open drive handle AFTER locking all volumes
+            self.status.emit("Opening destination drive...")
             dh = open_write(self.dst.path)
             self.log.emit("Drive handle opened")
-
-            # Lock and dismount destination volumes
-            self.status.emit("Locking destination volumes...")
-            for p in self.dst.parts:
-                if p.letter:
-                    vh = lock_vol(p.letter)
-                    if vh: locks.append(vh); self.log.emit(f"  Locked & dismounted {p.letter}")
 
             # Restore
             self.status.emit("Restoring..."); self.progress.emit(0)
