@@ -1,5 +1,5 @@
 """
-Cloned v2.0.1 — Sector-by-Sector Drive Cloning & Imaging Tool
+Cloned v2.0.2 — Sector-by-Sector Drive Cloning & Imaging Tool
 Clone entire drives, save drives to validated compressed image files,
 and restore images back to physical drives.
 Supports HDD, SATA SSD, NVMe, internal drives, and USB-connected drives.
@@ -74,7 +74,7 @@ _FlushBuffers  = kernel32.FlushFileBuffers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 APP_NAME    = "Cloned"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 CHUNK_SIZE  = 16 * 1024 * 1024  # 16 MB — larger chunks = fewer syscalls = faster
 IMG_MAGIC   = b"CLONED01"
 IMG_FMT_VER = "1.0"
