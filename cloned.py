@@ -1,5 +1,5 @@
 """
-Cloned v2.0.0 — Sector-by-Sector Drive Cloning & Imaging Tool
+Cloned v2.0.1 — Sector-by-Sector Drive Cloning & Imaging Tool
 Clone entire drives, save drives to validated compressed image files,
 and restore images back to physical drives.
 Supports HDD, SATA SSD, NVMe, internal drives, and USB-connected drives.
@@ -74,13 +74,14 @@ _FlushBuffers  = kernel32.FlushFileBuffers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 APP_NAME    = "Cloned"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 CHUNK_SIZE  = 16 * 1024 * 1024  # 16 MB — larger chunks = fewer syscalls = faster
 IMG_MAGIC   = b"CLONED01"
 IMG_FMT_VER = "1.0"
 ZLIB_LEVEL  = 3                  # 1-9, 3 = fast compression with decent ratio
 MAX_RETRIES = 5                  # Retries per chunk on read/write failure
 RETRY_DELAY = 0.3                # Seconds between retries (increases with backoff)
+MAX_CONSECUTIVE_FAILS = 10       # Abort after N consecutive chunk failures (USB disconnect)
 
 # Human-readable Win32 error codes
 WIN32_ERRORS = {
@@ -246,6 +247,24 @@ def open_write(path: str):
         raise OSError(f"Cannot open {path} for writing (error {_GetLastError()}). "
                       "Is the drive locked by another process or BitLocker-encrypted?")
     return h
+
+def reopen_write(old_h, path: str, log_fn=None):
+    """Try to close stale handle and reopen. Returns new handle or None."""
+    try:
+        _CloseHandle(old_h)
+    except Exception:
+        pass
+    try:
+        h = _CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING,
+                         FILE_FLAG_NO_BUFFERING, None)
+        if h != INVALID_HANDLE_VALUE:
+            if log_fn: log_fn("  Handle reopened successfully after USB glitch")
+            return h
+    except Exception:
+        pass
+    if log_fn: log_fn("  Handle reopen FAILED — drive may have disconnected")
+    return None
 
 def seek(h, pos: int):
     np = ctypes.c_longlong(0)
@@ -682,7 +701,7 @@ class CloneWorker(QThread):
 
             self.status.emit("Cloning...")
             trk = Tracker()
-            done = 0; errors = 0
+            done = 0; errors = 0; consec_fails = 0; consec_read_fails = 0
             buf = ctypes.create_string_buffer(chunk)
             br = wintypes.DWORD(0); bw = wintypes.DWORD(0)
 
@@ -704,25 +723,47 @@ class CloneWorker(QThread):
                         self.log.emit(f"  Read retry {attempt+1}/{MAX_RETRIES} @ {done} "
                                       f"— {win32_err(_GetLastError())}, waiting {delay:.1f}s")
                         time.sleep(delay)
-                if not read_ok:
-                    errors += 1
+                if read_ok:
+                    consec_read_fails = 0
+                else:
+                    errors += 1; consec_read_fails += 1
                     self.log.emit(f"  Read FAILED @ {done} after {MAX_RETRIES} attempts — {win32_err(_GetLastError())}, zero-filling")
                     ctypes.memset(buf, 0, rs); br.value = rs
+                    if consec_read_fails >= MAX_CONSECUTIVE_FAILS:
+                        self.log.emit(f"\n⛔ ABORTING — {consec_read_fails} consecutive read failures.\n"
+                                      f"  The source drive has likely disconnected (USB bridge issue).\n"
+                                      f"  Try a different USB cable, port, or enclosure and run the clone again.")
+                        self.finished_sig.emit(False, f"Aborted: {consec_read_fails} consecutive read failures — drive disconnected")
+                        return
 
-                # Write with retry
+                # Write with retry + handle reopen on first failure
                 write_ok = False
                 for attempt in range(MAX_RETRIES):
                     seek(dh, done)
                     if _WriteFile(dh, buf, br.value, ctypes.byref(bw), None):
                         write_ok = True; break
+                    err_code = _GetLastError()
+                    # On first failure with error 5/21, try reopening handle (USB glitch recovery)
+                    if attempt == 0 and err_code in (5, 21):
+                        self.log.emit(f"  Write failed @ {done} — {win32_err(err_code)}, attempting handle reopen...")
+                        new_h = reopen_write(dh, self.dst.path, lambda m: self.log.emit(m))
+                        if new_h: dh = new_h; continue  # retry immediately with new handle
                     if attempt < MAX_RETRIES - 1:
                         delay = RETRY_DELAY * (attempt + 1)
                         self.log.emit(f"  Write retry {attempt+1}/{MAX_RETRIES} @ {done} "
-                                      f"— {win32_err(_GetLastError())}, waiting {delay:.1f}s")
+                                      f"— {win32_err(err_code)}, waiting {delay:.1f}s")
                         time.sleep(delay)
-                if not write_ok:
-                    errors += 1
+                if write_ok:
+                    consec_fails = 0
+                else:
+                    errors += 1; consec_fails += 1
                     self.log.emit(f"  Write FAILED @ {done} after {MAX_RETRIES} attempts — {win32_err(_GetLastError())}")
+                    if consec_fails >= MAX_CONSECUTIVE_FAILS:
+                        self.log.emit(f"\n⛔ ABORTING — {consec_fails} consecutive write failures.\n"
+                                      f"  The destination drive has likely disconnected (USB bridge issue).\n"
+                                      f"  Try a different USB cable, port, or enclosure and run the restore again.")
+                        self.finished_sig.emit(False, f"Aborted: {consec_fails} consecutive write failures — drive disconnected")
+                        return
 
                 done += br.value
                 trk.tick(done, total, self)
@@ -841,7 +882,7 @@ class ImagingWorker(QThread):
             self.status.emit("Imaging...")
             buf = ctypes.create_string_buffer(chunk)
             br = wintypes.DWORD(0)
-            trk = Tracker(); done = 0; full_h = hashlib.sha256()
+            trk = Tracker(); done = 0; full_h = hashlib.sha256(); consec_fails = 0
 
             while done < total:
                 if self._cancel: self.finished_sig.emit(False, "Cancelled"); return
@@ -860,9 +901,18 @@ class ImagingWorker(QThread):
                         self.log.emit(f"  Read retry {attempt+1}/{MAX_RETRIES} @ {done} "
                                       f"— {win32_err(_GetLastError())}, waiting {delay:.1f}s")
                         time.sleep(delay)
-                if not read_ok:
+                if read_ok:
+                    consec_fails = 0
+                else:
+                    consec_fails += 1
                     self.log.emit(f"  Read FAILED @ {done} after {MAX_RETRIES} attempts — {win32_err(_GetLastError())}, zero-filling")
                     ctypes.memset(buf, 0, rs); br.value = rs
+                    if consec_fails >= MAX_CONSECUTIVE_FAILS:
+                        self.log.emit(f"\n⛔ ABORTING — {consec_fails} consecutive read failures.\n"
+                                      f"  The source drive has likely disconnected (USB bridge issue).\n"
+                                      f"  Try a different USB cable, port, or enclosure and run the imaging again.")
+                        self.finished_sig.emit(False, f"Aborted: {consec_fails} consecutive read failures — drive disconnected")
+                        return
 
                 actual = min(br.value, total - done)
                 raw = bytes(buf[:actual])
@@ -1017,7 +1067,7 @@ class RestoreWorker(QThread):
             fp.read(8)  # magic
             hl = struct.unpack("<Q", fp.read(8))[0]; fp.read(hl)
 
-            trk = Tracker(); done = 0; errors = 0
+            trk = Tracker(); done = 0; errors = 0; consec_fails = 0
             bw = wintypes.DWORD(0)
 
             while True:
@@ -1040,14 +1090,28 @@ class RestoreWorker(QThread):
                     seek(dh, done)
                     if _WriteFile(dh, wb, len(raw), ctypes.byref(bw), None):
                         write_ok = True; break
+                    err_code = _GetLastError()
+                    # On first failure with error 5/21, try reopening handle (USB glitch recovery)
+                    if attempt == 0 and err_code in (5, 21):
+                        self.log.emit(f"  Write failed @ {done} — {win32_err(err_code)}, attempting handle reopen...")
+                        new_h = reopen_write(dh, self.dst.path, lambda m: self.log.emit(m))
+                        if new_h: dh = new_h; continue  # retry immediately with new handle
                     if attempt < MAX_RETRIES - 1:
                         delay = RETRY_DELAY * (attempt + 1)
                         self.log.emit(f"  Write retry {attempt+1}/{MAX_RETRIES} @ {done} "
-                                      f"— {win32_err(_GetLastError())}, waiting {delay:.1f}s")
+                                      f"— {win32_err(err_code)}, waiting {delay:.1f}s")
                         time.sleep(delay)
-                if not write_ok:
-                    errors += 1
+                if write_ok:
+                    consec_fails = 0
+                else:
+                    errors += 1; consec_fails += 1
                     self.log.emit(f"  Write FAILED @ {done} after {MAX_RETRIES} attempts — {win32_err(_GetLastError())}")
+                    if consec_fails >= MAX_CONSECUTIVE_FAILS:
+                        self.log.emit(f"\n⛔ ABORTING — {consec_fails} consecutive write failures.\n"
+                                      f"  The destination drive has likely disconnected (USB bridge issue).\n"
+                                      f"  Try a different USB cable, port, or enclosure and run the restore again.")
+                        self.finished_sig.emit(False, f"Aborted: {consec_fails} consecutive write failures — drive disconnected")
+                        return
 
                 done += len(raw); trk.tick(done, expected, self)
 
