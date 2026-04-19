@@ -52,6 +52,10 @@ FSCTL_UNLOCK_VOLUME   = 0x0009001C
 FSCTL_DISMOUNT_VOLUME = 0x00090020
 IOCTL_DISK_GET_LENGTH = 0x0007405C
 
+# Sleep prevention
+ES_CONTINUOUS         = 0x80000000
+ES_SYSTEM_REQUIRED    = 0x00000001
+
 kernel32       = ctypes.windll.kernel32
 _CreateFileW   = kernel32.CreateFileW
 _CreateFileW.restype = wintypes.HANDLE
@@ -173,6 +177,15 @@ def elevate_uac():
 
 def sys_drive() -> str:
     return os.environ.get("SystemDrive", "C:")
+
+def prevent_sleep():
+    """Prevent Windows from sleeping while an operation is running.
+    USB drives disconnect during sleep, which kills the operation."""
+    kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+
+def allow_sleep():
+    """Re-allow Windows to sleep after operation completes."""
+    kernel32.SetThreadExecutionState(ES_CONTINUOUS)
 
 def run_ps(cmd: str, timeout: int = 30) -> Tuple[bool, str]:
     """Run a PowerShell command and return (success, stdout)."""
@@ -1446,6 +1459,7 @@ class MainWin(QMainWindow):
         self.log_box.clear()
         self._log(f"{'='*50}\n  {APP_NAME} v{APP_VERSION} — {op.title()}\n  {datetime.now():%Y-%m-%d %H:%M:%S}\n{'='*50}")
         w.start()
+        prevent_sleep()
 
         self.go_btn.setEnabled(False); self.scan_btn.setEnabled(False); self.vfy_cb.setEnabled(False)
         self.pause_btn.setEnabled(True); self.xbtn.setEnabled(True)
@@ -1486,6 +1500,7 @@ class MainWin(QMainWindow):
                     f"Could not auto-expand: {msg}\n\nYou can expand manually in Disk Management.")
 
     def _done(self, ok, msg):
+        allow_sleep()
         self.worker = None
         ic = "✅" if ok else "❌"; c = "#16c79a" if ok else "#e94560"
         self.phase_lbl.setText(f"{ic} {'Complete' if ok else 'Failed'}")
