@@ -905,9 +905,9 @@ class RestoreWorker(QThread):
     log            = pyqtSignal(str)
     offer_expand   = pyqtSignal(int, int)
 
-    def __init__(self, path: str, dst: DriveInfo, verify: bool):
+    def __init__(self, path: str, dst: DriveInfo, verify: bool, validate: bool = True):
         super().__init__()
-        self.img_path, self.dst, self.verify = path, dst, verify
+        self.img_path, self.dst, self.verify, self.validate = path, dst, verify, validate
         self._cancel = False
         self._pe = threading.Event(); self._pe.set()
         self._paused = False
@@ -930,14 +930,17 @@ class RestoreWorker(QThread):
             self.log.emit(f"Dest:   Disk {self.dst.index} — {self.dst.model} ({self.dst.size_str})")
             expected = meta.src_size
 
-            # Validate image first
-            self.phase.emit("validate"); self.status.emit("Validating image...")
-            self.log.emit("Validating image before restore...")
-            ok, vmsg = self._validate(expected)
-            if not ok:
-                self.log.emit(f"Validation FAILED: {vmsg}")
-                self.finished_sig.emit(False, f"Image validation failed: {vmsg}"); return
-            self.log.emit("Image validation PASSED — safe to restore")
+            # Validate image first (if enabled)
+            if self.validate:
+                self.phase.emit("validate"); self.status.emit("Validating image...")
+                self.log.emit("Validating image before restore...")
+                ok, vmsg = self._validate(expected)
+                if not ok:
+                    self.log.emit(f"Validation FAILED: {vmsg}")
+                    self.finished_sig.emit(False, f"Image validation failed: {vmsg}"); return
+                self.log.emit("Image validation PASSED — safe to restore")
+            else:
+                self.log.emit("Image validation skipped")
 
             # Clear read-only attribute (USB drives sometimes get this)
             self.phase.emit("restore"); self.status.emit("Preparing destination disk...")
@@ -1316,6 +1319,7 @@ class MainWin(QMainWindow):
         # Controls
         cl = QHBoxLayout(); cl.setSpacing(16)
         self.vfy_cb = QCheckBox("Verify after operation"); self.vfy_cb.setChecked(True); cl.addWidget(self.vfy_cb)
+        self.val_cb = QCheckBox("Validate image before restore"); self.val_cb.setChecked(True); cl.addWidget(self.val_cb)
         cl.addStretch()
         self.pause_btn = QPushButton("⏸️ Pause"); self.pause_btn.setEnabled(False); self.pause_btn.setFixedWidth(110); self.pause_btn.clicked.connect(self._pause); cl.addWidget(self.pause_btn)
         self.xbtn = QPushButton("✖️ Cancel"); self.xbtn.setEnabled(False); self.xbtn.setFixedWidth(110)
@@ -1465,7 +1469,7 @@ class MainWin(QMainWindow):
         note.setStyleSheet("color:#16c79a; padding:4px;"); ws.append(note)
         if ConfirmDlg("Confirm Restore", ws, self).exec() != QDialog.DialogCode.Accepted: return
 
-        self.worker = RestoreWorker(self.img_path, d, self.vfy_cb.isChecked())
+        self.worker = RestoreWorker(self.img_path, d, self.vfy_cb.isChecked(), self.val_cb.isChecked())
         self.worker.offer_expand.connect(self._offer_expand)
         self._wire("restore")
 
@@ -1485,7 +1489,7 @@ class MainWin(QMainWindow):
         w.start()
         prevent_sleep()
 
-        self.go_btn.setEnabled(False); self.scan_btn.setEnabled(False); self.vfy_cb.setEnabled(False)
+        self.go_btn.setEnabled(False); self.scan_btn.setEnabled(False); self.vfy_cb.setEnabled(False); self.val_cb.setEnabled(False)
         self.pause_btn.setEnabled(True); self.xbtn.setEnabled(True)
         for r in self.rb: r.setEnabled(False)
 
@@ -1529,7 +1533,7 @@ class MainWin(QMainWindow):
         ic = "✅" if ok else "❌"; c = "#16c79a" if ok else "#e94560"
         self.phase_lbl.setText(f"{ic} {'Complete' if ok else 'Failed'}")
         self.phase_lbl.setStyleSheet(f"font-size:13px; font-weight:bold; color:{c};")
-        self.go_btn.setEnabled(False); self.scan_btn.setEnabled(True); self.vfy_cb.setEnabled(True)
+        self.go_btn.setEnabled(False); self.scan_btn.setEnabled(True); self.vfy_cb.setEnabled(True); self.val_cb.setEnabled(True)
         self.pause_btn.setEnabled(False); self.xbtn.setEnabled(False)
         for r in self.rb: r.setEnabled(True)
         self._log(f"\n{msg}"); self.sbar.showMessage(msg)
