@@ -201,7 +201,7 @@ def run_diskpart(script: str):
     """Run a diskpart script silently."""
     try:
         subprocess.run(["diskpart"], input=script, capture_output=True,
-                       text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+                       text=True, timeout=120, creationflags=subprocess.CREATE_NO_WINDOW)
     except Exception:
         pass
 
@@ -312,7 +312,7 @@ def clear_readonly(disk_idx: int, log_fn=None):
     script = f"select disk {disk_idx}\nattributes disk clear readonly\n"
     try:
         r = subprocess.run(["diskpart"], input=script, capture_output=True,
-                           text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+                           text=True, timeout=120, creationflags=subprocess.CREATE_NO_WINDOW)
         if log_fn:
             if "successfully" in r.stdout.lower() or r.returncode == 0:
                 log_fn("  Cleared read-only attribute")
@@ -328,7 +328,7 @@ def clean_disk(disk_idx: int, log_fn=None):
     script = f"select disk {disk_idx}\nclean\n"
     try:
         r = subprocess.run(["diskpart"], input=script, capture_output=True,
-                           text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+                           text=True, timeout=120, creationflags=subprocess.CREATE_NO_WINDOW)
         if log_fn:
             if "succeeded" in r.stdout.lower() or "clean" in r.stdout.lower():
                 log_fn("  Disk cleaned — partition table wiped")
